@@ -9,7 +9,7 @@ use std::env;
 use anyhow::{Context, Result};
 use rig::agent::Agent;
 use rig::client::CompletionClient;
-use rig::completion::{Prompt, PromptError};
+use rig::completion::{Chat, Message, PromptError};
 use rig::providers::openai::{CompletionModel, CompletionsClient};
 
 use crate::tools::{Explore, Grep, ReadFile};
@@ -90,9 +90,13 @@ async fn running_model(base_url: &str) -> Result<String> {
 ///
 /// Hides the underlying rig [`CompletionsClient`] and all configuration
 /// (endpoint, model, credentials, system preamble) behind a small surface.
+///
+/// Keeps the running conversation in `history` so the model remembers earlier
+/// turns within a session.
 pub struct LLMClient {
     agent: Agent<CompletionModel>,
     model: String,
+    history: Vec<Message>,
 }
 
 impl LLMClient {
@@ -124,7 +128,11 @@ impl LLMClient {
             .default_max_turns(MAX_TURNS)
             .build();
 
-        Ok(Self { agent, model })
+        Ok(Self {
+            agent,
+            model,
+            history: Vec::new(),
+        })
     }
 
     /// The model name this client is talking to.
@@ -133,7 +141,12 @@ impl LLMClient {
     }
 
     /// Send a prompt to the LLM and return its reply.
-    pub async fn ask(&self, prompt: &str) -> Result<String, PromptError> {
-        self.agent.prompt(prompt).await
+    ///
+    /// The prompt and the model's response (including any tool calls/results)
+    /// are appended to the running conversation, so later prompts can refer back
+    /// to earlier ones.
+    pub async fn ask(&mut self, prompt: &str) -> Result<String, PromptError> {
+        // `chat` reads the prior history and appends this turn's messages to it.
+        self.agent.chat(prompt, &mut self.history).await
     }
 }

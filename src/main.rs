@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
 
     // The model is whatever is currently loaded in fastflowlm.
     let config = LlmConfig::resolve(cli.base_url).await?;
-    let llm = LLMClient::new(config).context("failed to build LLM client")?;
+    let mut llm = LLMClient::new(config).context("failed to build LLM client")?;
 
     // One-shot mode: answer a single prompt and exit without the interactive shell.
     if let Some(prompt) = cli.ask {
