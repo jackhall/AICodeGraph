@@ -6,7 +6,7 @@ mod llm;
 mod tools;
 
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -61,12 +61,20 @@ async fn main() -> Result<()> {
     tracing::info!(
         %shell,
         model = llm.model(),
-        "shell ready — '@ <text>' asks the LLM; Ctrl-D or 'exit' to quit"
+        "shell ready — '@ <text>' asks the LLM; '/clear' resets it; Ctrl-D or 'exit' to quit"
     );
 
+    // Measure the baseline (system prompt + tools) and context window for the bar.
+    llm.prime().await;
 
     let stdin = io::stdin();
     loop {
+        // Show how full the conversation's context is, just above the prompt.
+        // Skipped when stdout isn't a terminal (e.g. piped) to keep output clean.
+        if io::stdout().is_terminal() {
+            let (used, capacity) = llm.context_usage();
+            println!("{}", context_bar(used, capacity));
+        }
         print!("{} ❯ ", cwd.display());
         io::stdout().flush().ok();
 
@@ -89,6 +97,13 @@ async fn main() -> Result<()> {
         }
         if line == "exit" || line == "quit" {
             break;
+        }
+
+        // `/clear` -> forget the conversation so far.
+        if line == "/clear" {
+            llm.clear();
+            println!("(conversation cleared)");
+            continue;
         }
 
         // `@` -> ask the local LLM.
@@ -133,6 +148,32 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Render a context-fill bar: `ctx [████░░░░] 1234/4096 (30%)`, colored green →
+/// yellow → red as it fills. If the window is unknown, just shows the count.
+fn context_bar(used: u64, capacity: Option<u64>) -> String {
+    const WIDTH: usize = 24;
+    match capacity {
+        Some(cap) if cap > 0 => {
+            let frac = (used as f64 / cap as f64).clamp(0.0, 1.0);
+            let filled = ((frac * WIDTH as f64).round() as usize).min(WIDTH);
+            let color = if frac < 0.7 {
+                "\x1b[32m" // green
+            } else if frac < 0.9 {
+                "\x1b[33m" // yellow
+            } else {
+                "\x1b[31m" // red
+            };
+            let bar = format!(
+                "{color}{}\x1b[0m{}",
+                "█".repeat(filled),
+                "░".repeat(WIDTH - filled)
+            );
+            format!("ctx [{bar}] {used}/{cap} ({:.0}%)", frac * 100.0)
+        }
+        _ => format!("ctx [{used} tokens, window unknown]"),
+    }
 }
 
 /// Wipe the scratch directory, logging (not failing) on error.
