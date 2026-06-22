@@ -12,8 +12,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
+use rustyline::{Config, DefaultEditor, EditMode};
 use tracing_subscriber::EnvFilter;
 
 use llm::{LLMClient, LlmConfig};
@@ -30,6 +30,10 @@ struct Cli {
     /// Ask the LLM a single prompt, print the reply, and exit (no interactive shell).
     #[arg(short, long, value_name = "PROMPT")]
     ask: Option<String>,
+
+    /// Use vi key bindings for line editing instead of the default emacs ones.
+    #[arg(long)]
+    vi: bool,
 
     /// Increase log verbosity (-v for debug, -vv for trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -69,7 +73,9 @@ async fn main() -> Result<()> {
     // Measure the baseline (system prompt + tools) and context window for the bar.
     llm.prime().await;
 
-    let mut rl = DefaultEditor::new().context("initializing line editor")?;
+    let edit_mode = if cli.vi { EditMode::Vi } else { EditMode::Emacs };
+    let rl_config = Config::builder().edit_mode(edit_mode).build();
+    let mut rl = DefaultEditor::with_config(rl_config).context("initializing line editor")?;
     let history_path = env::var_os("HOME").map(|h| PathBuf::from(h).join(".aicg_history"));
     if let Some(path) = &history_path {
         let _ = rl.load_history(path);
