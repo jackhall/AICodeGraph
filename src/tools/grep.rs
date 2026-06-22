@@ -108,28 +108,18 @@ impl Tool for Grep {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Search file contents with grep, within the current working directory. \
-                          Read-only: only safe grep flags are accepted (e.g. -i, -n, -r, -l, -c, \
-                          -A/-B/-C N, --include=GLOB); file-writing or non-grep usage is rejected. \
-                          Pass `path` to scope the search (a file or directory, default '.'; use \
-                          -r in `flags` to recurse into a directory). Full output is written to a \
-                          scratch file you can read with read_file."
+            description: "Read-only grep over files in the working directory (use -r in \
+                          `flags` to recurse). Output saved to a scratch file."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Regular expression to search for."
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "File or directory within the CWD to search. Defaults to '.'."
-                    },
+                    "pattern": { "type": "string", "description": "Regex to search for" },
+                    "path": { "type": "string", "description": "File or dir, default '.'" },
                     "flags": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional read-only grep flags, e.g. [\"-r\", \"-n\", \"-i\"]."
+                        "description": "Read-only grep flags, e.g. [\"-r\",\"-n\",\"-i\"]"
                     }
                 },
                 "required": ["pattern"]

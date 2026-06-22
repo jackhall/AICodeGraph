@@ -91,25 +91,14 @@ impl Tool for Explore {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Explore the directory structure within the current working directory. \
-                          Without a pattern, lists the immediate contents of `path` (directories \
-                          marked with a trailing '/'). With a wildcard `pattern` like '*.rs', \
-                          recursively lists every file in the subtree under `path` whose name \
-                          matches. The full listing is written to a scratch file you can read \
-                          with read_file."
+            description: "List a directory, or recursively find files matching a wildcard \
+                          `pattern`. Output saved to a scratch file."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory to explore, relative to the CWD. Defaults to '.'."
-                    },
-                    "pattern": {
-                        "type": "string",
-                        "description": "Optional filename wildcard, e.g. '*.rs'. Triggers a \
-                                        recursive search of the subtree."
-                    }
+                    "path": { "type": "string", "description": "Directory, default '.'" },
+                    "pattern": { "type": "string", "description": "Filename wildcard, e.g. *.rs" }
                 }
             }),
         }

@@ -9,8 +9,8 @@ use std::env;
 use anyhow::{Context, Result};
 use rig::agent::Agent;
 use rig::client::CompletionClient;
-use rig::agent::PromptRequest;
 use rig::completion::{Chat, Message, PromptError};
+use rig::tool::Tool;
 use rig::providers::openai::{CompletionModel, CompletionsClient};
 
 use crate::tools::{Explore, Grep, ReadFile};
@@ -22,8 +22,7 @@ const MAX_TURNS: usize = 5;
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8001/v1";
 /// System prompt that shapes the assistant's behavior.
 const PREAMBLE: &str = "You are an assistant embedded in a Unix shell. Be concise. \
-     You can read text files within the current working directory with the `read_file` tool; \
-     use it when answering questions about local files.";
+     Use the file tools to answer questions about files in the working directory.";
 
 /// Connection settings for the local LLM.
 ///
@@ -181,7 +180,7 @@ impl LLMClient {
             .filter_map(|m| serde_json::to_string(m).ok())
             .map(|s| s.len())
             .sum();
-        (chars / 4) as u64
+        estimate_tokens(chars)
     }
 
     /// Forget the conversation so far. Usage falls back to the fixed baseline
@@ -190,21 +189,29 @@ impl LLMClient {
         self.history.clear();
     }
 
-    /// Prepare the context meter: measure the fixed per-request overhead and the
-    /// server's context window. Best-effort — failures leave the meter at zero /
-    /// "window unknown". Also warms the server's prefix cache.
+    /// Prepare the context meter: probe the server for its context window and the
+    /// fixed per-request overhead (system preamble + tool schemas).
+    ///
+    /// We send a probe mirroring a real request (same preamble + tools) and read
+    /// `active_kv_tokens` — the true KV occupancy, which is stable regardless of
+    /// FastFlowLM's prefix caching (`prompt_tokens` is not).
     pub async fn prime(&mut self) {
-        // A throwaway call with empty history: its prompt is just the preamble +
-        // tool schemas, so its input token count is our fixed baseline.
-        let probe = PromptRequest::from_agent(&self.agent, ".")
-            .with_history(Vec::<Message>::new())
-            .extended_details()
-            .await;
-        if let Ok(response) = probe {
-            self.baseline = response.usage.input_tokens;
-        }
+        let tools: Vec<serde_json::Value> = [
+            ReadFile.definition(String::new()).await,
+            Explore.definition(String::new()).await,
+            Grep.definition(String::new()).await,
+        ]
+        .iter()
+        .filter_map(|d| serde_json::to_value(d).ok())
+        .map(|d| serde_json::json!({ "type": "function", "function": d }))
+        .collect();
 
-        self.context_window = context_capacity(&self.base_url, &self.model).await;
+        if let Some((capacity, baseline)) =
+            probe_context(&self.base_url, &self.model, PREAMBLE, &tools).await
+        {
+            self.context_window = Some(capacity);
+            self.baseline = baseline;
+        }
         tracing::debug!(
             baseline = self.baseline,
             capacity = ?self.context_window,
@@ -213,13 +220,30 @@ impl LLMClient {
     }
 }
 
-/// Read the server's `max_kv_token_capacity` from a tiny streaming completion
-/// (the field only appears in the streaming usage block).
-async fn context_capacity(base_url: &str, model: &str) -> Option<u64> {
+/// Rough token estimate. JSON and source code tokenize denser than prose
+/// (~3 chars/token), so we use that rather than the usual ~4.
+fn estimate_tokens(chars: usize) -> u64 {
+    (chars / 3) as u64
+}
+
+/// Probe FastFlowLM with a request mirroring a real one (same preamble + tools)
+/// and read `(max_kv_token_capacity, active_kv_tokens)` from the streaming usage
+/// block — i.e. the context window and the fixed baseline occupancy. Both fields
+/// only appear when streaming.
+async fn probe_context(
+    base_url: &str,
+    model: &str,
+    preamble: &str,
+    tools: &[serde_json::Value],
+) -> Option<(u64, u64)> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
-        "messages": [{"role": "user", "content": "hi"}],
+        "messages": [
+            {"role": "system", "content": preamble},
+            {"role": "user", "content": "hi"},
+        ],
+        "tools": tools,
         "max_tokens": 1,
         "stream": true,
     });
@@ -233,9 +257,16 @@ async fn context_capacity(base_url: &str, model: &str) -> Option<u64> {
         .await
         .ok()?;
 
-    let key = "\"max_kv_token_capacity\":";
-    let start = text.find(key)? + key.len();
-    let rest = &text[start..];
+    let capacity = parse_usage_field(&text, "max_kv_token_capacity")?;
+    let baseline = parse_usage_field(&text, "active_kv_tokens").unwrap_or(0);
+    Some((capacity, baseline))
+}
+
+/// Pull an integer `"key":N` value out of a raw SSE/JSON response body.
+fn parse_usage_field(body: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\":");
+    let start = body.find(&needle)? + needle.len();
+    let rest = &body[start..];
     let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
     rest[..end].parse().ok()
 }

@@ -63,19 +63,11 @@ impl Tool for ReadFile {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Read the UTF-8 text contents of a file located within the current \
-                          working directory. Use this to read scratch files produced by the \
-                          explore/grep tools. Paths that escape the working directory (via '..' \
-                          or symlinks) are rejected."
-                .to_string(),
+            description: "Read a text file in the working directory.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file, relative to the current working \
-                                        directory, e.g. 'src/main.rs' or 'ai-scratch/grep-0.txt'."
-                    }
+                    "path": { "type": "string", "description": "File path, e.g. src/main.rs" }
                 },
                 "required": ["path"]
             }),
