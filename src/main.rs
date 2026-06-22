@@ -31,7 +31,8 @@ struct Cli {
     #[arg(short, long, value_name = "PROMPT")]
     ask: Option<String>,
 
-    /// Use vi key bindings for line editing instead of the default emacs ones.
+    /// Force vi key bindings (otherwise follows ~/.inputrc's editing-mode,
+    /// defaulting to emacs).
     #[arg(long)]
     vi: bool,
 
@@ -73,7 +74,12 @@ async fn main() -> Result<()> {
     // Measure the baseline (system prompt + tools) and context window for the bar.
     llm.prime().await;
 
-    let edit_mode = if cli.vi { EditMode::Vi } else { EditMode::Emacs };
+    // --vi forces vi; otherwise honor the user's readline config (~/.inputrc).
+    let edit_mode = if cli.vi {
+        EditMode::Vi
+    } else {
+        inputrc_edit_mode().unwrap_or(EditMode::Emacs)
+    };
     let rl_config = Config::builder().edit_mode(edit_mode).build();
     let mut rl = DefaultEditor::with_config(rl_config).context("initializing line editor")?;
     let history_path = env::var_os("HOME").map(|h| PathBuf::from(h).join(".aicg_history"));
@@ -161,6 +167,28 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Read the readline editing mode from `$INPUTRC` (or `~/.inputrc`), honoring
+/// the last `set editing-mode vi|emacs` directive. Returns `None` if there's no
+/// inputrc or it doesn't set a mode.
+fn inputrc_edit_mode() -> Option<EditMode> {
+    let path = env::var_os("INPUTRC")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".inputrc")))?;
+    let text = std::fs::read_to_string(path).ok()?;
+
+    let mut mode = None;
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("set editing-mode") {
+            match rest.trim() {
+                "vi" => mode = Some(EditMode::Vi),
+                "emacs" => mode = Some(EditMode::Emacs),
+                _ => {}
+            }
+        }
+    }
+    mode
 }
 
 /// Render a context-fill bar: `ctx [████░░░░] 1234/4096 (30%)`, colored green →
