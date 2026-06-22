@@ -6,14 +6,13 @@ mod llm;
 mod tools;
 
 use std::env;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rustyline::error::ReadlineError;
-use rustyline::{Config, DefaultEditor, EditMode};
+use linefeed::{DefaultTerminal, Interface, ReadResult, Signal};
 use tracing_subscriber::EnvFilter;
 
 use llm::{LLMClient, LlmConfig};
@@ -30,11 +29,6 @@ struct Cli {
     /// Ask the LLM a single prompt, print the reply, and exit (no interactive shell).
     #[arg(short, long, value_name = "PROMPT")]
     ask: Option<String>,
-
-    /// Force vi key bindings (otherwise follows ~/.inputrc's editing-mode,
-    /// defaulting to emacs).
-    #[arg(long)]
-    vi: bool,
 
     /// Increase log verbosity (-v for debug, -vv for trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -74,18 +68,8 @@ async fn main() -> Result<()> {
     // Measure the baseline (system prompt + tools) and context window for the bar.
     llm.prime().await;
 
-    // --vi forces vi; otherwise honor the user's readline config (~/.inputrc).
-    let edit_mode = if cli.vi {
-        EditMode::Vi
-    } else {
-        inputrc_edit_mode().unwrap_or(EditMode::Emacs)
-    };
-    let rl_config = Config::builder().edit_mode(edit_mode).build();
-    let mut rl = DefaultEditor::with_config(rl_config).context("initializing line editor")?;
     let history_path = env::var_os("HOME").map(|h| PathBuf::from(h).join(".aicg_history"));
-    if let Some(path) = &history_path {
-        let _ = rl.load_history(path);
-    }
+    let reader = LineReader::new(history_path.as_deref())?;
 
     loop {
         // Show how full the conversation's context is, just above the prompt.
@@ -95,21 +79,16 @@ async fn main() -> Result<()> {
             println!("{}", context_bar(used, capacity));
         }
 
-        let line = match rl.readline(&format!("{} ❯ ", cwd.display())) {
-            Ok(line) => line,
-            Err(ReadlineError::Interrupted) => continue, // Ctrl-C: discard the line
-            Err(ReadlineError::Eof) => break,            // Ctrl-D
-            Err(e) => {
-                tracing::error!("read error: {e}");
-                break;
-            }
+        let line = match reader.read(&format!("{} ❯ ", cwd.display())) {
+            Some(line) => line,
+            None => break, // EOF (Ctrl-D)
         };
 
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        rl.add_history_entry(line).ok();
+        reader.add_history(line);
         if line == "exit" || line == "quit" {
             break;
         }
@@ -163,32 +142,77 @@ async fn main() -> Result<()> {
     }
 
     if let Some(path) = &history_path {
-        let _ = rl.save_history(path);
+        reader.save_history(path);
     }
 
     Ok(())
 }
 
-/// Read the readline editing mode from `$INPUTRC` (or `~/.inputrc`), honoring
-/// the last `set editing-mode vi|emacs` directive. Returns `None` if there's no
-/// inputrc or it doesn't set a mode.
-fn inputrc_edit_mode() -> Option<EditMode> {
-    let path = env::var_os("INPUTRC")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".inputrc")))?;
-    let text = std::fs::read_to_string(path).ok()?;
+/// Line input: full readline honoring `~/.inputrc` on a terminal, or plain stdin
+/// when piped/non-interactive (linefeed needs a real tty).
+enum LineReader {
+    Interactive(Interface<DefaultTerminal>),
+    Plain(io::Stdin),
+}
 
-    let mut mode = None;
-    for line in text.lines() {
-        if let Some(rest) = line.trim().strip_prefix("set editing-mode") {
-            match rest.trim() {
-                "vi" => mode = Some(EditMode::Vi),
-                "emacs" => mode = Some(EditMode::Emacs),
-                _ => {}
+impl LineReader {
+    fn new(history: Option<&Path>) -> Result<Self> {
+        if !io::stdin().is_terminal() {
+            return Ok(LineReader::Plain(io::stdin()));
+        }
+        // linefeed reads the standard readline config itself ($INPUTRC, then
+        // ~/.inputrc): editing mode, key bindings, conditionals, and all.
+        let iface = Interface::new("aicg").context("initializing line editor")?;
+        iface.set_report_signal(Signal::Interrupt, true); // Ctrl-C cancels the line
+        if let Some(path) = history {
+            let _ = iface.load_history(path);
+        }
+        Ok(LineReader::Interactive(iface))
+    }
+
+    /// Read one line. `None` means EOF (exit); a Ctrl-C returns an empty line so
+    /// the caller just shows a fresh prompt.
+    fn read(&self, prompt: &str) -> Option<String> {
+        match self {
+            LineReader::Interactive(iface) => {
+                iface.set_prompt(prompt).ok()?;
+                match iface.read_line() {
+                    Ok(ReadResult::Input(line)) => Some(line),
+                    Ok(ReadResult::Signal(_)) => Some(String::new()),
+                    Ok(ReadResult::Eof) => None,
+                    Err(e) => {
+                        tracing::error!("read error: {e}");
+                        None
+                    }
+                }
+            }
+            LineReader::Plain(stdin) => {
+                print!("{prompt}");
+                io::stdout().flush().ok();
+                let mut line = String::new();
+                match stdin.read_line(&mut line) {
+                    Ok(0) => None,
+                    Ok(_) => Some(line),
+                    Err(e) => {
+                        tracing::error!("read error: {e}");
+                        None
+                    }
+                }
             }
         }
     }
-    mode
+
+    fn add_history(&self, line: &str) {
+        if let LineReader::Interactive(iface) = self {
+            iface.add_history_unique(line.to_string());
+        }
+    }
+
+    fn save_history(&self, path: &Path) {
+        if let LineReader::Interactive(iface) = self {
+            let _ = iface.save_history(path);
+        }
+    }
 }
 
 /// Render a context-fill bar: `ctx [████░░░░] 1234/4096 (30%)`, colored green →
