@@ -97,7 +97,20 @@ pub struct LLMClient {
     agent: Agent<CompletionModel>,
     model: String,
     base_url: String,
+    /// rig's running conversation (for chat continuity / tool loop).
     history: Vec<Message>,
+    /// OpenAI-format tool schemas, kept for the context probes.
+    tools: Vec<serde_json::Value>,
+    /// Our own record of the user/assistant turns, in OpenAI message form. Built
+    /// as messages flow through [`Self::ask`] so the calibration probe can replay
+    /// the conversation without reconstructing rig's internal message format.
+    transcript: Vec<serde_json::Value>,
+    /// Running character count of [`Self::transcript`] content.
+    conv_chars: usize,
+    /// Calibrated chars-per-token ratio for the conversation estimate.
+    chars_per_token: f64,
+    /// Turns since the last calibration probe.
+    turns_since_calibration: u32,
     /// Fixed per-request overhead: the system preamble + tool schemas that are
     /// sent on every turn. This is the floor the context never drops below
     /// (`/clear` resets to it, not to zero). Measured once against the server.
@@ -105,6 +118,11 @@ pub struct LLMClient {
     /// The server's context window (`max_kv_token_capacity`), once detected.
     context_window: Option<u64>,
 }
+
+/// Run a calibration probe every this many turns.
+const CALIBRATE_EVERY: u32 = 4;
+/// Chars-per-token assumption until the first calibration refines it.
+const DEFAULT_CHARS_PER_TOKEN: f64 = 3.0;
 
 impl LLMClient {
     /// Build a client from the given [`LlmConfig`].
@@ -140,6 +158,11 @@ impl LLMClient {
             model,
             base_url,
             history: Vec::new(),
+            tools: Vec::new(),
+            transcript: Vec::new(),
+            conv_chars: 0,
+            chars_per_token: DEFAULT_CHARS_PER_TOKEN,
+            turns_since_calibration: 0,
             baseline: 0,
             context_window: None,
         })
@@ -159,34 +182,70 @@ impl LLMClient {
     pub async fn ask(&mut self, prompt: &str) -> Result<String, PromptError> {
         // `chat` feeds the prior history back in and appends this turn's prompt +
         // assistant/tool messages to it.
-        self.agent.chat(prompt, &mut self.history).await
+        let reply = self.agent.chat(prompt, &mut self.history).await?;
+
+        // Record this step as it flows through, so the meter (and the calibration
+        // probe) never has to reconstruct the conversation from rig's internals.
+        self.record("user", prompt);
+        self.record("assistant", &reply);
+
+        self.turns_since_calibration += 1;
+        if self.turns_since_calibration >= CALIBRATE_EVERY {
+            self.calibrate().await;
+            self.turns_since_calibration = 0;
+        }
+
+        Ok(reply)
+    }
+
+    /// Append a turn to the transcript and its running character count.
+    fn record(&mut self, role: &str, text: &str) {
+        self.conv_chars += text.len();
+        self.transcript
+            .push(serde_json::json!({ "role": role, "content": text }));
     }
 
     /// Estimated context usage (baseline + conversation) and the window if known.
     ///
-    /// The conversation portion is estimated locally from the messages we hold
-    /// (~4 chars/token), rather than from the server's per-turn token counts:
-    /// FastFlowLM's prefix caching makes those report only deltas, which can't be
-    /// turned into a reliable absolute total.
+    /// The conversation portion is `conv_chars / chars_per_token`, where the ratio
+    /// is recalibrated against the server every [`CALIBRATE_EVERY`] turns (see
+    /// [`Self::calibrate`]). The baseline is exact (measured in [`Self::prime`]).
     pub fn context_usage(&self) -> (u64, Option<u64>) {
-        (self.baseline + self.history_tokens(), self.context_window)
-    }
-
-    /// Rough token estimate of the held conversation history.
-    fn history_tokens(&self) -> u64 {
-        let chars: usize = self
-            .history
-            .iter()
-            .filter_map(|m| serde_json::to_string(m).ok())
-            .map(|s| s.len())
-            .sum();
-        estimate_tokens(chars)
+        let conv = (self.conv_chars as f64 / self.chars_per_token).round() as u64;
+        (self.baseline + conv, self.context_window)
     }
 
     /// Forget the conversation so far. Usage falls back to the fixed baseline
-    /// (the system prompt + tool schemas are still sent on every request).
+    /// (the system prompt + tool schemas are still sent on every request). The
+    /// calibrated ratio is kept.
     pub fn clear(&mut self) {
         self.history.clear();
+        self.transcript.clear();
+        self.conv_chars = 0;
+        self.turns_since_calibration = 0;
+    }
+
+    /// Refine `chars_per_token` against ground truth: probe the server with the
+    /// recorded transcript and read the true KV occupancy (`active_kv_tokens`).
+    async fn calibrate(&mut self) {
+        if self.conv_chars == 0 {
+            return;
+        }
+        let mut messages = vec![serde_json::json!({ "role": "system", "content": PREAMBLE })];
+        messages.extend(self.transcript.iter().cloned());
+
+        if let Some((_, active_kv)) = probe(&self.base_url, &self.model, &messages, &self.tools).await
+        {
+            if active_kv > self.baseline {
+                let real_conv = (active_kv - self.baseline) as f64;
+                self.chars_per_token = (self.conv_chars as f64 / real_conv).clamp(1.5, 8.0);
+                tracing::debug!(
+                    active_kv,
+                    ratio = self.chars_per_token,
+                    "calibrated context meter"
+                );
+            }
+        }
     }
 
     /// Prepare the context meter: probe the server for its context window and the
@@ -196,7 +255,7 @@ impl LLMClient {
     /// `active_kv_tokens` — the true KV occupancy, which is stable regardless of
     /// FastFlowLM's prefix caching (`prompt_tokens` is not).
     pub async fn prime(&mut self) {
-        let tools: Vec<serde_json::Value> = [
+        self.tools = [
             ReadFile.definition(String::new()).await,
             Explore.definition(String::new()).await,
             Grep.definition(String::new()).await,
@@ -206,8 +265,12 @@ impl LLMClient {
         .map(|d| serde_json::json!({ "type": "function", "function": d }))
         .collect();
 
+        let messages = vec![
+            serde_json::json!({ "role": "system", "content": PREAMBLE }),
+            serde_json::json!({ "role": "user", "content": "hi" }),
+        ];
         if let Some((capacity, baseline)) =
-            probe_context(&self.base_url, &self.model, PREAMBLE, &tools).await
+            probe(&self.base_url, &self.model, &messages, &self.tools).await
         {
             self.context_window = Some(capacity);
             self.baseline = baseline;
@@ -220,29 +283,20 @@ impl LLMClient {
     }
 }
 
-/// Rough token estimate. JSON and source code tokenize denser than prose
-/// (~3 chars/token), so we use that rather than the usual ~4.
-fn estimate_tokens(chars: usize) -> u64 {
-    (chars / 3) as u64
-}
-
-/// Probe FastFlowLM with a request mirroring a real one (same preamble + tools)
-/// and read `(max_kv_token_capacity, active_kv_tokens)` from the streaming usage
-/// block — i.e. the context window and the fixed baseline occupancy. Both fields
-/// only appear when streaming.
-async fn probe_context(
+/// Probe FastFlowLM with the given messages + tools and read
+/// `(max_kv_token_capacity, active_kv_tokens)` from the streaming usage block —
+/// i.e. the context window and the request's true KV occupancy. Both fields only
+/// appear when streaming. `max_tokens: 1` keeps the generation negligible.
+async fn probe(
     base_url: &str,
     model: &str,
-    preamble: &str,
+    messages: &[serde_json::Value],
     tools: &[serde_json::Value],
 ) -> Option<(u64, u64)> {
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
-        "messages": [
-            {"role": "system", "content": preamble},
-            {"role": "user", "content": "hi"},
-        ],
+        "messages": messages,
         "tools": tools,
         "max_tokens": 1,
         "stream": true,
