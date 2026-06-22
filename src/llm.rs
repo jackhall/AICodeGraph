@@ -9,6 +9,7 @@ use std::env;
 use anyhow::{Context, Result};
 use rig::agent::Agent;
 use rig::client::CompletionClient;
+use rig::completion::message::{AssistantContent, ToolResultContent, UserContent};
 use rig::completion::{Chat, Message, PromptError};
 use rig::tool::Tool;
 use rig::providers::openai::{CompletionModel, CompletionsClient};
@@ -101,11 +102,13 @@ pub struct LLMClient {
     history: Vec<Message>,
     /// OpenAI-format tool schemas, kept for the context probes.
     tools: Vec<serde_json::Value>,
-    /// Our own record of the user/assistant turns, in OpenAI message form. Built
-    /// as messages flow through [`Self::ask`] so the calibration probe can replay
-    /// the conversation without reconstructing rig's internal message format.
+    /// The full conversation (incl. tool calls/results) in OpenAI message form,
+    /// converted from rig's history as it grows. The calibration probe replays
+    /// this, so it mirrors what rig actually sends.
     transcript: Vec<serde_json::Value>,
-    /// Running character count of [`Self::transcript`] content.
+    /// How many of `history`'s messages have already been folded into `transcript`.
+    recorded: usize,
+    /// Running character count of [`Self::transcript`].
     conv_chars: usize,
     /// Calibrated chars-per-token ratio for the conversation estimate.
     chars_per_token: f64,
@@ -160,6 +163,7 @@ impl LLMClient {
             history: Vec::new(),
             tools: Vec::new(),
             transcript: Vec::new(),
+            recorded: 0,
             conv_chars: 0,
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
             turns_since_calibration: 0,
@@ -184,25 +188,26 @@ impl LLMClient {
         // assistant/tool messages to it.
         let reply = self.agent.chat(prompt, &mut self.history).await?;
 
-        // Record this step as it flows through, so the meter (and the calibration
-        // probe) never has to reconstruct the conversation from rig's internals.
-        self.record("user", prompt);
-        self.record("assistant", &reply);
+        // Fold the new messages — including any tool calls/results rig added this
+        // turn — into the transcript, so the meter accounts for tool context too.
+        let new_messages = self.history.len() - self.recorded;
+        for msg in &self.history[self.recorded..] {
+            for om in message_to_openai(msg) {
+                self.conv_chars += serde_json::to_string(&om).map(|s| s.len()).unwrap_or(0);
+                self.transcript.push(om);
+            }
+        }
+        self.recorded = self.history.len();
 
+        // Recalibrate periodically, but also right after a tool-using turn (more
+        // than the user+assistant pair was added) since those move context most.
         self.turns_since_calibration += 1;
-        if self.turns_since_calibration >= CALIBRATE_EVERY {
+        if self.turns_since_calibration >= CALIBRATE_EVERY || new_messages > 2 {
             self.calibrate().await;
             self.turns_since_calibration = 0;
         }
 
         Ok(reply)
-    }
-
-    /// Append a turn to the transcript and its running character count.
-    fn record(&mut self, role: &str, text: &str) {
-        self.conv_chars += text.len();
-        self.transcript
-            .push(serde_json::json!({ "role": role, "content": text }));
     }
 
     /// Estimated context usage (baseline + conversation) and the window if known.
@@ -221,6 +226,7 @@ impl LLMClient {
     pub fn clear(&mut self) {
         self.history.clear();
         self.transcript.clear();
+        self.recorded = 0;
         self.conv_chars = 0;
         self.turns_since_calibration = 0;
     }
@@ -280,6 +286,73 @@ impl LLMClient {
             capacity = ?self.context_window,
             "primed context meter"
         );
+    }
+}
+
+/// Convert one rig [`Message`] into the OpenAI chat message(s) it corresponds to,
+/// preserving tool calls and tool results (which carry most of the token weight).
+/// A single rig message can expand to several (e.g. a user turn bundling several
+/// tool results), so this returns a `Vec`.
+fn message_to_openai(msg: &Message) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    match msg {
+        Message::System { content } => vec![json!({ "role": "system", "content": content })],
+
+        Message::User { content } => {
+            let mut out = Vec::new();
+            let mut text = Vec::new();
+            for c in content.iter() {
+                match c {
+                    UserContent::Text(t) => text.push(t.text().to_string()),
+                    // Tool results are their own `tool` role message in OpenAI form.
+                    UserContent::ToolResult(tr) => {
+                        let body = tr
+                            .content
+                            .iter()
+                            .filter_map(|rc| match rc {
+                                ToolResultContent::Text(t) => Some(t.text().to_string()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        out.push(json!({
+                            "role": "tool",
+                            "tool_call_id": tr.id,
+                            "content": body,
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            if !text.is_empty() {
+                out.insert(0, json!({ "role": "user", "content": text.join("\n") }));
+            }
+            out
+        }
+
+        Message::Assistant { content, .. } => {
+            let mut text = Vec::new();
+            let mut tool_calls = Vec::new();
+            for c in content.iter() {
+                match c {
+                    AssistantContent::Text(t) => text.push(t.text().to_string()),
+                    AssistantContent::ToolCall(tc) => tool_calls.push(json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": serde_json::to_string(&tc.function.arguments).unwrap_or_default(),
+                        },
+                    })),
+                    _ => {}
+                }
+            }
+            let mut m = json!({ "role": "assistant", "content": text.join("\n") });
+            if !tool_calls.is_empty() {
+                m["tool_calls"] = json!(tool_calls);
+            }
+            vec![m]
+        }
     }
 }
 
