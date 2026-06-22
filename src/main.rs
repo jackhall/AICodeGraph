@@ -6,12 +6,14 @@ mod llm;
 mod tools;
 
 use std::env;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use tracing_subscriber::EnvFilter;
 
 use llm::{LLMClient, LlmConfig};
@@ -67,7 +69,12 @@ async fn main() -> Result<()> {
     // Measure the baseline (system prompt + tools) and context window for the bar.
     llm.prime().await;
 
-    let stdin = io::stdin();
+    let mut rl = DefaultEditor::new().context("initializing line editor")?;
+    let history_path = env::var_os("HOME").map(|h| PathBuf::from(h).join(".aicg_history"));
+    if let Some(path) = &history_path {
+        let _ = rl.load_history(path);
+    }
+
     loop {
         // Show how full the conversation's context is, just above the prompt.
         // Skipped when stdout isn't a terminal (e.g. piped) to keep output clean.
@@ -75,26 +82,22 @@ async fn main() -> Result<()> {
             let (used, capacity) = llm.context_usage();
             println!("{}", context_bar(used, capacity));
         }
-        print!("{} ❯ ", cwd.display());
-        io::stdout().flush().ok();
 
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) => {
-                println!();
-                break; // EOF (Ctrl-D)
-            }
-            Ok(_) => {}
+        let line = match rl.readline(&format!("{} ❯ ", cwd.display())) {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => continue, // Ctrl-C: discard the line
+            Err(ReadlineError::Eof) => break,            // Ctrl-D
             Err(e) => {
                 tracing::error!("read error: {e}");
                 break;
             }
-        }
+        };
 
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
+        rl.add_history_entry(line).ok();
         if line == "exit" || line == "quit" {
             break;
         }
@@ -145,6 +148,10 @@ async fn main() -> Result<()> {
             Ok(_) => {}
             Err(e) => tracing::error!("failed to run command: {e}"),
         }
+    }
+
+    if let Some(path) = &history_path {
+        let _ = rl.save_history(path);
     }
 
     Ok(())
