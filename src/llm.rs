@@ -12,17 +12,22 @@ use rig::client::CompletionClient;
 use rig::completion::{Prompt, PromptError};
 use rig::providers::openai::{CompletionModel, CompletionsClient};
 
+use crate::tools::{Explore, Grep, ReadFile};
+
+/// How many tool-call/response turns a single prompt may take before stopping.
+const MAX_TURNS: usize = 5;
+
 /// OpenAI-compatible endpoint exposed by the local lemonade / FastFlowLM server.
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8001/v1";
-/// Model to talk to. Overridable with `FLM_MODEL`.
-const DEFAULT_MODEL: &str = "qwen3.5-9b-FLM";
 /// System prompt that shapes the assistant's behavior.
-const PREAMBLE: &str = "You are an assistant embedded in a Unix shell. Be concise.";
+const PREAMBLE: &str = "You are an assistant embedded in a Unix shell. Be concise. \
+     You can read text files within the current working directory with the `read_file` tool; \
+     use it when answering questions about local files.";
 
 /// Connection settings for the local LLM.
 ///
-/// Build the defaults (plus any `FLM_*` env overrides) with [`LlmConfig::from_env`],
-/// then mutate fields to apply higher-priority overrides (e.g. CLI flags).
+/// Build one with [`LlmConfig::resolve`], which layers CLI overrides, `FLM_*`
+/// env vars, the model currently loaded in FastFlowLM, and built-in defaults.
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub base_url: String,
@@ -31,18 +36,54 @@ pub struct LlmConfig {
 }
 
 impl LlmConfig {
-    /// Resolve settings from the environment, falling back to sensible defaults
-    /// for the local lemonade / FastFlowLM server.
+    /// Resolve settings from CLI overrides, the environment, and the server.
     ///
-    /// Honors `FLM_BASE_URL`, `FLM_MODEL`, and `FLM_API_KEY`.
-    pub fn from_env() -> Self {
-        Self {
-            base_url: env::var("FLM_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
-            model: env::var("FLM_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
-            // The local server ignores the key, but rig requires one.
-            api_key: env::var("FLM_API_KEY").unwrap_or_else(|_| "local".to_string()),
-        }
+    /// Base URL and key come from the override / `FLM_BASE_URL` / `FLM_API_KEY` /
+    /// defaults. The model is always whatever is currently loaded in FastFlowLM
+    /// (via `/api/ps`); if that can't be detected (server down, or nothing
+    /// loaded), this fails rather than guessing.
+    pub async fn resolve(base_url_override: Option<String>) -> Result<Self> {
+        let base_url = base_url_override
+            .or_else(|| env::var("FLM_BASE_URL").ok())
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        // The local server ignores the key, but rig requires one.
+        let api_key = env::var("FLM_API_KEY").unwrap_or_else(|_| "local".to_string());
+
+        let model = running_model(&base_url).await?;
+        tracing::debug!(%model, "using model currently loaded in fastflowlm");
+
+        Ok(Self {
+            base_url,
+            model,
+            api_key,
+        })
     }
+}
+
+/// Ask FastFlowLM which model is currently loaded, via its Ollama-style
+/// `/api/ps` endpoint (sibling of the `/v1` API root).
+///
+/// Fails if the server is unreachable or reports no loaded model.
+async fn running_model(base_url: &str) -> Result<String> {
+    // `/api/ps` lives at the host root, not under `/v1`.
+    let host = base_url
+        .strip_suffix("/v1")
+        .or_else(|| base_url.strip_suffix("/v1/"))
+        .unwrap_or(base_url)
+        .trim_end_matches('/');
+    let url = format!("{host}/api/ps");
+
+    let json: serde_json::Value = reqwest::get(&url)
+        .await
+        .with_context(|| format!("could not reach FastFlowLM at {url} — is it running?"))?
+        .json()
+        .await
+        .with_context(|| format!("unexpected response from {url}"))?;
+
+    json["models"][0]["name"]
+        .as_str()
+        .map(String::from)
+        .with_context(|| format!("no model is currently loaded in FastFlowLM (per {url})"))
 }
 
 /// A handle to the local LLM.
@@ -74,7 +115,14 @@ impl LLMClient {
             .build()
             .with_context(|| format!("building LLM client for {base_url}"))?;
 
-        let agent = client.agent(&model).preamble(PREAMBLE).build();
+        let agent = client
+            .agent(&model)
+            .preamble(PREAMBLE)
+            .tool(ReadFile)
+            .tool(Explore)
+            .tool(Grep)
+            .default_max_turns(MAX_TURNS)
+            .build();
 
         Ok(Self { agent, model })
     }

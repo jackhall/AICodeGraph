@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+
+# Runtime scratch dir for the LLM tools (wiped on start/exit)
+/ai-scratch

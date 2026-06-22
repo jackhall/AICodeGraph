@@ -17,10 +17,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "glob",
+ "reqwest",
  "rig-core",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]

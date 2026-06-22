@@ -3,6 +3,7 @@
 //! (FastFlowLM / lemonade). All LLM interaction lives in [`llm::LLMClient`].
 
 mod llm;
+mod tools;
 
 use std::env;
 use std::io::{self, Write};
@@ -20,10 +21,6 @@ use llm::{LLMClient, LlmConfig};
 #[derive(Debug, Parser)]
 #[command(name = "aicg", version, about)]
 struct Cli {
-    /// Model to query (overrides $FLM_MODEL and the built-in default).
-    #[arg(short, long)]
-    model: Option<String>,
-
     /// Base URL of the OpenAI-compatible LLM server (overrides $FLM_BASE_URL).
     #[arg(long)]
     base_url: Option<String>,
@@ -42,15 +39,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
-    // Defaults + env, then let CLI flags take precedence.
-    let mut config = LlmConfig::from_env();
-    if let Some(model) = cli.model {
-        config.model = model;
-    }
-    if let Some(base_url) = cli.base_url {
-        config.base_url = base_url;
-    }
+    // Start fresh, and ensure the scratch dir is wiped on every exit path.
+    clear_scratch();
+    let _scratch_guard = ScratchGuard;
 
+    // The model is whatever is currently loaded in fastflowlm.
+    let config = LlmConfig::resolve(cli.base_url).await?;
     let llm = LLMClient::new(config).context("failed to build LLM client")?;
 
     // One-shot mode: answer a single prompt and exit without the interactive shell.
@@ -69,6 +63,7 @@ async fn main() -> Result<()> {
         model = llm.model(),
         "shell ready — '@ <text>' asks the LLM; Ctrl-D or 'exit' to quit"
     );
+
 
     let stdin = io::stdin();
     loop {
@@ -140,6 +135,23 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Wipe the scratch directory, logging (not failing) on error.
+fn clear_scratch() {
+    if let Err(e) = tools::scratch::reset() {
+        tracing::warn!("could not reset {}: {e}", tools::scratch::SCRATCH_DIR);
+    }
+}
+
+/// Clears the scratch directory when dropped, so it's wiped on every exit path
+/// (normal return, `?` propagation, or unwinding panic).
+struct ScratchGuard;
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        clear_scratch();
+    }
+}
+
 /// Initialize tracing. `RUST_LOG` wins if set; otherwise `-v` flags raise our
 /// crate's level while keeping noisy dependencies at `warn`.
 fn init_tracing(verbose: u8) {
@@ -149,7 +161,7 @@ fn init_tracing(verbose: u8) {
         _ => "trace",
     };
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("warn,aicodegraph={app_level}")));
+        .unwrap_or_else(|_| EnvFilter::new(format!("warn,aicg={app_level}")));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
